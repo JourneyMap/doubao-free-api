@@ -1227,7 +1227,7 @@ async function receiveStream(stream: any): Promise<any> {
                             const img = c?.image || {};
                             const key = img?.key as string | undefined;
                             const preview = img?.image_preview?.url || img?.image_thumb?.url;
-                            const ori = img?.image_ori?.url;
+                            const ori = img?.image_ori_raw?.url || img?.image_ori?.url;
                             if (key && !emittedImageKeys.has(key)) {
                                 emittedImageKeys.add(key);
                                 images.push({key, preview, ori, thumb: img?.image_thumb?.url});
@@ -1372,7 +1372,7 @@ function createTransStream(stream: any, endCallback?: Function) {
                     const img = c?.image || {};
                     const key = img?.key as string | undefined;
                     const url = img?.image_preview?.url || img?.image_thumb?.url || img?.image_ori?.url;
-                    const ori = img?.image_ori?.url || url;
+                    const ori = img?.image_ori_raw?.url || img?.image_ori?.url || url;
                     if (key && url && !emittedImageKeys.has(key)) {
                         emittedImageKeys.add(key);
                         const idx = emittedImageKeys.size;

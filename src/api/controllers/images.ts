@@ -1029,7 +1029,7 @@ async function receiveStream(stream: any): Promise<any> {
                         payload.creations.forEach((c: any) => {
                             const img = c?.image || {};
                             const key = img?.key as string | undefined;
-                            const ori = img?.image_ori?.url;
+                            const ori = img?.image_ori_raw?.url || img?.image_ori?.url;
                             if (key && ori && !emittedImageKeys.has(key)) {
                                 emittedImageKeys.add(key);
                                 imageUrls.push(ori);

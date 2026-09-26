@@ -987,11 +987,12 @@ const EXTRA_MESSAGE_GRACE_MS = 45000;
 /**
  * 从一条 creation 里取图片地址
  *
- * 豆包不一定每次都填 image_ori，缺的时候用流式通道一直在用的那条兜底链。
+ * 优先无水印原件 image_ori_raw（fork 原有的改法），拿不到再按流式通道一直在用的那条兜底链退。
  */
 function pickCreationUrl(img: any): string | null {
     if (!img) return null;
     const candidates = [
+        img?.image_ori_raw?.url,
         img?.image_ori?.url,
         img?.image_preview?.url,
         img?.image_thumb?.url,

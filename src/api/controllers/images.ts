@@ -223,6 +223,12 @@ async function createImageCompletion(
                 logger.error(`参考图上传失败：${err.message}`);
                 throw new APIException(EX.API_REQUEST_FAILED, "参考图上传失败");
             }
+            // uploadFile 对图片是「失败就返回 null」，不补这一刀就会静默变成无参考图生图
+            if (!attachments.length)
+                throw new APIException(
+                    EX.API_REQUEST_FAILED,
+                    "参考图上传失败：豆包没有收下这张图（未拿到 tos 存储地址），已终止，避免生成一张没有参考图的图"
+                );
         }
 
         const contentJson = JSON.stringify({
@@ -281,7 +287,11 @@ async function createImageCompletion(
         }
 
         const streamStartTime = util.timestamp();
-        const answer = await receiveStream(response.data);
+        const hasRef = attachments.length > 0;
+        const answer = await receiveStream(response.data, {
+            keepReadingAfterMessageEnd: hasRef,
+            debugEvents: hasRef,
+        });
         logger.success(
             `图片生成流传输完成 ${util.timestamp() - streamStartTime}ms`
         );
@@ -346,6 +356,12 @@ async function createImageCompletionStream(
                 logger.error(`参考图上传失败：${err.message}`);
                 throw new APIException(EX.API_REQUEST_FAILED, "参考图上传失败");
             }
+            // uploadFile 对图片是「失败就返回 null」，不补这一刀就会静默变成无参考图生图
+            if (!attachments.length)
+                throw new APIException(
+                    EX.API_REQUEST_FAILED,
+                    "参考图上传失败：豆包没有收下这张图（未拿到 tos 存储地址），已终止，避免生成一张没有参考图的图"
+                );
         }
 
         const imageMessage = [
@@ -416,6 +432,7 @@ async function createImageCompletionStream(
         }
 
         const streamStartTime = util.timestamp();
+        const hasRef = attachments.length > 0;
         return createTransStream(response.data, (convId: string) => {
             logger.success(
                 `流式图片生成传输完成 ${util.timestamp() - streamStartTime}ms`
@@ -423,6 +440,9 @@ async function createImageCompletionStream(
             removeConversation(convId, refreshToken).catch(
                 (err) => console.error(err)
             );
+        }, {
+            keepReadingAfterMessageEnd: hasRef,
+            debugEvents: hasRef,
         });
     })().catch((err) => {
         if (retryCount < MAX_RETRY_COUNT) {
@@ -950,11 +970,89 @@ function checkResult(result: AxiosResponse) {
 }
 
 /**
+ * 读取上游流时的附加选项
+ *
+ * keepReadingAfterMessageEnd: 事件 2003 只代表「这一条消息说完了」。带参考图时豆包会先回
+ *   一句计划文本就收尾这条消息，图片在后面的消息里，所以不能在这里停手。
+ * debugEvents: 把每条上游事件的骨架写进日志，用来定位图片到底藏在哪个事件里。
+ */
+type StreamReadOptions = {
+    keepReadingAfterMessageEnd?: boolean;
+    debugEvents?: boolean;
+};
+
+// 消息结束后继续等待后续消息的上限（毫秒）。超时仍未出图就按现状收尾，避免吊死到 axios 的 300s。
+const EXTRA_MESSAGE_GRACE_MS = 45000;
+
+/**
+ * 从一条 creation 里取图片地址
+ *
+ * 优先无水印原件 image_ori_raw（fork 原有的改法），拿不到再按流式通道一直在用的那条兜底链退。
+ */
+function pickCreationUrl(img: any): string | null {
+    if (!img) return null;
+    const candidates = [
+        img?.image_ori_raw?.url,
+        img?.image_ori?.url,
+        img?.image_preview?.url,
+        img?.image_thumb?.url,
+        img?.url,
+    ];
+    for (const c of candidates)
+        if (typeof c === "string" && c) return c;
+    return null;
+}
+
+/**
+ * 把 2074 事件里的 creations 收进目标数组（按 key 或地址去重）
+ */
+function collectCreationUrls(
+    payload: any,
+    target: string[],
+    seen: Set<string>
+): number {
+    if (!payload || !Array.isArray(payload.creations)) return 0;
+    let added = 0;
+    payload.creations.forEach((c: any) => {
+        const img = c?.image || c;
+        const url = pickCreationUrl(img);
+        if (!url) return;
+        const dedupeKey = (typeof img?.key === "string" && img.key) ? img.key : url;
+        if (seen.has(dedupeKey)) return;
+        seen.add(dedupeKey);
+        target.push(url);
+        added++;
+    });
+    return added;
+}
+
+/**
+ * 上游事件摘要（只留判断需要的字段，长文本截断、base64 掩码）
+ */
+function describeStreamEvent(rawResult: any, result: any): string {
+    const message = result?.message || {};
+    const raw = typeof message.content === "string" ? message.content : "";
+    const preview = maskBase64InString(raw).replace(/\s+/g, " ").slice(0, 180);
+    return [
+        `event_type=${rawResult?.event_type}`,
+        `content_type=${message.content_type ?? "-"}`,
+        `is_finish=${result?.is_finish ?? "-"}`,
+        `msg_id=${message.message_id ? String(message.message_id).slice(-6) : "-"}`,
+        `len=${raw.length}`,
+        `text=${preview}`,
+    ].join(" ");
+}
+
+/**
  * 从流接收完整的消息内容
  *
  * @param stream 消息流
+ * @param options 读取策略（见 StreamReadOptions）
  */
-async function receiveStream(stream: any): Promise<any> {
+async function receiveStream(
+    stream: any,
+    options: StreamReadOptions = {}
+): Promise<any> {
     let temp = Buffer.from('');
     const imageUrls: string[] = [];
     const emittedImageKeys = new Set<string>();
@@ -978,9 +1076,44 @@ async function receiveStream(stream: any): Promise<any> {
             created: util.unixTimestamp(),
         };
         let isEnd = false;
+        let settled = false;
+        let graceTimer: any = null;
         const finalize = () => {
             data.choices[0].message.content = data.choices[0].message.content.replace(/\n$/, "");
             data.choices[0].message.images = imageUrls;
+        };
+        const done = () => {
+            if (settled) return;
+            settled = true;
+            isEnd = true;
+            if (graceTimer) {
+                clearTimeout(graceTimer);
+                graceTimer = null;
+            }
+            finalize();
+            resolve(data);
+            // 已经拿到答案就断开上游，否则豆包挂着连接时会白等到 axios 的 300s 超时
+            try {
+                stream.destroy && stream.destroy();
+            } catch {
+            }
+        };
+        const onMessageEnd = () => {
+            if (!options.keepReadingAfterMessageEnd || imageUrls.length > 0)
+                return done();
+            if (!graceTimer) {
+                logger.info(`[stream] 消息结束但还没有图片，继续等后续消息（最多 ${EXTRA_MESSAGE_GRACE_MS / 1000}s）`);
+                graceTimer = setTimeout(done, EXTRA_MESSAGE_GRACE_MS);
+            }
+        };
+        const logEvent = (rawResult: any, result: any) => {
+            if (!options.debugEvents) return;
+            // 2001 是逐字文本增量，一条回复能刷出上百行，跳过后只留下 creations 和意外事件
+            if (result?.message?.content_type === 2001) return;
+            try {
+                logger.info(`[stream.raw] ${describeStreamEvent(rawResult, result)}`);
+            } catch {
+            }
         };
         const parser = createParser((event) => {
             try {
@@ -991,9 +1124,8 @@ async function receiveStream(stream: any): Promise<any> {
                 if (rawResult.code)
                     throw new APIException(EX.API_REQUEST_FAILED, `[请求doubao失败]: ${rawResult.code}-${rawResult.message}`);
                 if (rawResult.event_type == 2003) {
-                    isEnd = true;
-                    finalize();
-                    return resolve(data);
+                    logEvent(rawResult, null);
+                    return onMessageEnd();
                 }
                 if (rawResult.event_type != 2001)
                     return;
@@ -1001,13 +1133,13 @@ async function receiveStream(stream: any): Promise<any> {
                 if (_.isError(result))
                     throw new Error(`Stream response invalid: ${rawResult.event_data}`);
                 if (result.is_finish) {
-                    isEnd = true;
-                    finalize();
-                    return resolve(data);
+                    logEvent(rawResult, result);
+                    return onMessageEnd();
                 }
                 if (!data.id && result.conversation_id)
                     data.id = result.conversation_id;
                 const message = result.message;
+                logEvent(rawResult, result);
                 if (!message || !message.content)
                     return;
                 let text = "";
@@ -1025,17 +1157,9 @@ async function receiveStream(stream: any): Promise<any> {
                 const ctype = message.content_type;
                 if (ctype === 2074) {
                     const payload = _.isError(parsed) ? _.attempt(() => JSON.parse(message.content)) : parsed;
-                    if (!_.isError(payload) && payload && Array.isArray(payload.creations)) {
-                        payload.creations.forEach((c: any) => {
-                            const img = c?.image || {};
-                            const key = img?.key as string | undefined;
-                            const ori = img?.image_ori_raw?.url || img?.image_ori?.url || url;
-                            if (key && ori && !emittedImageKeys.has(key)) {
-                                emittedImageKeys.add(key);
-                                imageUrls.push(ori);
-                            }
-                        });
-                    }
+                    const added = _.isError(payload) ? 0 : collectCreationUrls(payload, imageUrls, emittedImageKeys);
+                    if (added)
+                        logger.info(`[stream] 收到 ${added} 张图，累计 ${imageUrls.length} 张`);
                 }
             } catch (err) {
                 logger.error(err);
@@ -1053,11 +1177,11 @@ async function receiveStream(stream: any): Promise<any> {
             }
             parser.feed(buffer.toString());
         });
-        stream.once("error", (err) => reject(err));
-        stream.once("close", () => {
-            finalize();
-            resolve(data);
+        stream.once("error", (err) => {
+            if (settled) return;
+            reject(err);
         });
+        stream.once("close", () => done());
     });
 }
 
@@ -1066,8 +1190,13 @@ async function receiveStream(stream: any): Promise<any> {
  * 将流格式转换为gpt兼容流格式
  * @param stream 消息流
  * @param endCallback 传输结束回调
+ * @param options 读取策略（见 StreamReadOptions）
  */
-function createTransStream(stream: any, endCallback?: Function) {
+function createTransStream(
+    stream: any,
+    endCallback?: Function,
+    options: StreamReadOptions = {}
+) {
     let convId = "";
     let temp = Buffer.from('');
     // 消息创建时间
@@ -1075,8 +1204,59 @@ function createTransStream(stream: any, endCallback?: Function) {
     // 用于图片生成的提示与去重
     let imageNoticeSent = false;
     const emittedImageKeys = new Set<string>();
+    let finished = false;
+    let graceTimer: any = null;
     // 创建转换流
     const transStream = new PassThrough();
+    const writeChunk = (delta: any, finishReason: any) => {
+        if (transStream.closed) return;
+        transStream.write(`data: ${JSON.stringify({
+            id: convId,
+            model: MODEL_NAME,
+            object: "chat.completion.chunk",
+            choices: [
+                {
+                    index: 0,
+                    delta,
+                    finish_reason: finishReason,
+                },
+            ],
+            created,
+        })}\n\n`);
+    };
+    const finishTrans = () => {
+        if (finished) return;
+        finished = true;
+        if (graceTimer) {
+            clearTimeout(graceTimer);
+            graceTimer = null;
+        }
+        writeChunk({role: "assistant", content: ""}, "stop");
+        !transStream.closed && transStream.end("data: [DONE]\n\n");
+        endCallback && endCallback(convId);
+        // 已经收尾就断开上游，否则豆包挂着连接时会白等到 axios 的 300s 超时
+        try {
+            stream.destroy && stream.destroy();
+        } catch {
+        }
+    };
+    const onMessageEnd = () => {
+        if (!options.keepReadingAfterMessageEnd || emittedImageKeys.size > 0)
+            return finishTrans();
+        if (!graceTimer) {
+            logger.info(`[stream] 消息结束但还没有图片，继续等后续消息（最多 ${EXTRA_MESSAGE_GRACE_MS / 1000}s）`);
+            graceTimer = setTimeout(finishTrans, EXTRA_MESSAGE_GRACE_MS);
+        }
+    };
+    const logEvent = (rawResult: any, result: any) => {
+        if (!options.debugEvents) return;
+        // 2001 是逐字文本增量，一条回复能刷出上百行，跳过后只留下 creations 和意外事件
+        if (result?.message?.content_type === 2001) return;
+        try {
+            logger.info(`[stream.raw] ${describeStreamEvent(rawResult, result)}`);
+        } catch {
+        }
+    };
     !transStream.closed &&
     transStream.write(
         `data: ${JSON.stringify({
@@ -1095,7 +1275,7 @@ function createTransStream(stream: any, endCallback?: Function) {
     );
     const parser = createParser((event) => {
         try {
-            if (event.type !== "event") return;
+            if (event.type !== "event" || finished) return;
             // 解析JSON
             const rawResult = _.attempt(() => JSON.parse(event.data));
             if (_.isError(rawResult))
@@ -1103,22 +1283,13 @@ function createTransStream(stream: any, endCallback?: Function) {
             if (rawResult.code)
                 throw new APIException(EX.API_REQUEST_FAILED, `[请求doubao失败]: ${rawResult.code}-${rawResult.message}`);
             if (rawResult.event_type == 2003) {
-                transStream.write(`data: ${JSON.stringify({
-                    id: convId,
-                    model: MODEL_NAME,
-                    object: "chat.completion.chunk",
-                    choices: [
-                        {
-                            index: 0,
-                            delta: {role: "assistant", content: ""},
-                            finish_reason: "stop"
-                        },
-                    ],
-                    created,
-                })}\n\n`);
-                !transStream.closed && transStream.end("data: [DONE]\n\n");
-                endCallback && endCallback(convId);
-                return;
+                if (!convId && rawResult.event_data) {
+                    const ended = _.attempt(() => JSON.parse(rawResult.event_data));
+                    if (!_.isError(ended) && ended.conversation_id)
+                        convId = ended.conversation_id;
+                }
+                logEvent(rawResult, null);
+                return onMessageEnd();
             }
             if (rawResult.event_type != 2001) {
                 return;
@@ -1129,24 +1300,11 @@ function createTransStream(stream: any, endCallback?: Function) {
             if (!convId)
                 convId = result.conversation_id;
             if (result.is_finish) {
-                transStream.write(`data: ${JSON.stringify({
-                    id: convId,
-                    model: MODEL_NAME,
-                    object: "chat.completion.chunk",
-                    choices: [
-                        {
-                            index: 0,
-                            delta: {role: "assistant", content: ""},
-                            finish_reason: "stop"
-                        },
-                    ],
-                    created,
-                })}\n\n`);
-                !transStream.closed && transStream.end("data: [DONE]\n\n");
-                endCallback && endCallback(convId);
-                return;
+                logEvent(rawResult, result);
+                return onMessageEnd();
             }
             const message = result.message;
+            logEvent(rawResult, result);
             if (!message || !message.content)
                 return;
 
@@ -1156,46 +1314,19 @@ function createTransStream(stream: any, endCallback?: Function) {
             // 图片生成事件（content_type = 2074）
             const ctype = message.content_type;
             if (ctype === 2074 && !_.isError(content)) {
-                const creations = Array.isArray((content as any).creations) ? (content as any).creations : [];
-                if (!imageNoticeSent && creations.length) {
-                    const notice = `\n[图片生成中（共${creations.length}张）...]\n`;
-                    transStream.write(`data: ${JSON.stringify({
-                        id: convId,
-                        model: MODEL_NAME,
-                        object: "chat.completion.chunk",
-                        choices: [
-                            {
-                                index: 0,
-                                delta: {role: "assistant", content: notice},
-                                finish_reason: null,
-                            },
-                        ],
-                        created,
-                    })}\n\n`);
-                    imageNoticeSent = true;
-                }
-                for (const c of creations) {
-                    const img = c?.image || {};
-                    const key = img?.key as string | undefined;
-                    const url = img?.image_preview?.url || img?.image_thumb?.url || img?.image_ori?.url;
-                    const ori = img?.image_ori?.url || url;
-                    if (key && url && !emittedImageKeys.has(key)) {
-                        emittedImageKeys.add(key);
-                        const md = `${ori}\n`;
-                        transStream.write(`data: ${JSON.stringify({
-                            id: convId,
-                            model: MODEL_NAME,
-                            object: "chat.completion.chunk",
-                            choices: [
-                                {
-                                    index: 0,
-                                    delta: {role: "assistant", content: md},
-                                    finish_reason: null,
-                                },
-                            ],
-                            created,
-                        })}\n\n`);
+                const collected: string[] = [];
+                collectCreationUrls(content, collected, emittedImageKeys);
+                if (collected.length) {
+                    if (!imageNoticeSent) {
+                        writeChunk({
+                            role: "assistant",
+                            content: `\n[图片生成中（共${collected.length}张）...]\n`
+                        }, null);
+                        imageNoticeSent = true;
                     }
+                    logger.info(`[stream] 下发 ${collected.length} 张图，累计 ${emittedImageKeys.size} 张`);
+                    for (const url of collected)
+                        writeChunk({role: "assistant", content: `${url}\n`}, null);
                 }
             }
 
@@ -1225,7 +1356,7 @@ function createTransStream(stream: any, endCallback?: Function) {
             }
         } catch (err) {
             logger.error(err);
-            !transStream.closed && transStream.end("\n\n");
+            finishTrans();
         }
     });
     stream.on("data", (buffer) => {
@@ -1241,11 +1372,11 @@ function createTransStream(stream: any, endCallback?: Function) {
     });
     stream.once(
         "error",
-        () => !transStream.closed && transStream.end("data: [DONE]\n\n")
+        () => finishTrans()
     );
     stream.once(
         "close",
-        () => !transStream.closed && transStream.end("data: [DONE]\n\n")
+        () => finishTrans()
     );
     return transStream;
 }
